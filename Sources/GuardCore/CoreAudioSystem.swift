@@ -3,21 +3,38 @@ import CoreAudio
 
 /// Real CoreAudio implementation.
 ///
-/// Design notes:
-///  - AudioObjectIDs are never cached across events; every query resolves the
-///    UID afresh, so device-list churn (Bluetooth reconnects, coreaudiod
-///    restarts) cannot leave us acting on a stale ID.
-///  - All listeners funnel into a single `onChange` callback; the engine
-///    re-inspects full state on every event (idempotent sweep).
+/// Performance-critical design rules (a violation of any of these caused a
+/// runaway CPU loop in v1.0.0 — see TEST-RESULTS.md):
+///
+///  1. **Never re-arm listeners from inside a listener callback.** Adding and
+///     removing property listeners takes a process-wide HAL mutex; doing it on
+///     every notification serialises against coreaudiod's own delivery and
+///     burns CPU in both processes. Listeners are re-armed only on structural
+///     events (device list changed / coreaudiod restarted) or when the set of
+///     watched devices actually changes.
+///  2. **One device enumeration per sweep.** `snapshotDevices()` refreshes a
+///     UID→AudioObjectID map that every other call reuses, so a property read
+///     costs one IPC instead of a full enumeration.
+///  3. **Cache only immutable properties.** UID / name / transport never change
+///     for a live AudioObjectID, and these are the expensive CFString reads.
+///     The cache is dropped whenever the device ID set changes, so a recycled
+///     ID can never return another device's identity.
 public final class CoreAudioSystem: AudioSystem {
     public var onChange: (() -> Void)?
 
     private let queue = DispatchQueue(label: "bmr1guard.coreaudio")
+    private let cacheLock = NSLock()
+
     private var started = false
     private var watchedUIDs: [String] = []
-    /// Device-level listeners currently installed: (deviceID, address).
     private var deviceListeners: [(AudioObjectID, AudioObjectPropertyAddress)] = []
     private var listenerBlock: AudioObjectPropertyListenerBlock!
+
+    // Caches (guarded by cacheLock).
+    private var idByUID: [String: AudioObjectID] = [:]
+    private var knownDeviceIDs: [AudioObjectID] = []
+    private struct StaticInfo { let uid: String; let name: String; let transport: String }
+    private var staticByID: [AudioObjectID: StaticInfo] = [:]
 
     private static let systemObject = AudioObjectID(kAudioObjectSystemObject)
 
@@ -36,10 +53,24 @@ public final class CoreAudioSystem: AudioSystem {
     ]
 
     public init() {
-        listenerBlock = { [weak self] _, _ in
+        listenerBlock = { [weak self] count, addresses in
             guard let self else { return }
-            // Re-arm device listeners on any event: device IDs may have churned.
-            self.queue.async { self.rearmDeviceListeners() }
+            // Structural changes invalidate cached IDs and require re-arming.
+            // Everything else is just "re-inspect the world" — no listener churn.
+            var structural = false
+            for i in 0..<Int(count) {
+                let sel = addresses[i].mSelector
+                if sel == kAudioHardwarePropertyDevices || sel == kAudioHardwarePropertyServiceRestarted {
+                    structural = true
+                    break
+                }
+            }
+            if structural {
+                self.invalidateCaches()
+                // Deferred: never touch the HAL listener list while it is
+                // delivering a notification on this queue.
+                self.queue.async { self.rearmDeviceListeners() }
+            }
             self.onChange?()
         }
     }
@@ -68,12 +99,16 @@ public final class CoreAudioSystem: AudioSystem {
             }
             removeDeviceListeners()
         }
+        invalidateCaches()
     }
 
     public func watchDevices(uids: [String]) {
+        // Sorted: CoreAudio's enumeration order is not guaranteed stable, and an
+        // order-only difference must not be mistaken for a change.
+        let wanted = uids.sorted()
         queue.async {
-            guard self.watchedUIDs != uids else { return }
-            self.watchedUIDs = uids
+            guard self.watchedUIDs != wanted else { return }
+            self.watchedUIDs = wanted
             self.rearmDeviceListeners()
         }
     }
@@ -92,7 +127,7 @@ public final class CoreAudioSystem: AudioSystem {
         guard started else { return }
         removeDeviceListeners()
         for uid in watchedUIDs {
-            guard let dev = Self.deviceID(forUID: uid) else { continue }
+            guard let dev = deviceID(forUID: uid) else { continue }
             for sel in [kAudioDevicePropertyNominalSampleRate,
                         kAudioDevicePropertyDeviceIsRunningSomewhere,
                         kAudioDevicePropertyDeviceIsAlive] {
@@ -157,43 +192,83 @@ public final class CoreAudioSystem: AudioSystem {
         getArray(systemObject, address(kAudioHardwarePropertyDevices), AudioObjectID.self)
     }
 
-    private static func deviceID(forUID uid: String) -> AudioObjectID? {
-        allDeviceIDs().first { getString($0, kAudioDevicePropertyDeviceUID) == uid }
+    // MARK: - Caches
+
+    private func invalidateCaches() {
+        cacheLock.lock()
+        idByUID.removeAll()
+        staticByID.removeAll()
+        knownDeviceIDs.removeAll()
+        cacheLock.unlock()
     }
 
-    private static func info(for dev: AudioObjectID) -> AudioDeviceInfo? {
-        guard let uid = getString(dev, kAudioDevicePropertyDeviceUID) else { return nil }
-        let name = getString(dev, kAudioObjectPropertyName) ?? uid
-        let transport = getScalar(dev, address(kAudioDevicePropertyTransportType), UInt32.self).map(fourCC) ?? "?"
-        let alive = (getScalar(dev, address(kAudioDevicePropertyDeviceIsAlive), UInt32.self) ?? 1) != 0
-        return AudioDeviceInfo(uid: uid, name: name, transport: transport,
-                               hasInput: channelCount(dev, kAudioObjectPropertyScopeInput) > 0,
-                               hasOutput: channelCount(dev, kAudioObjectPropertyScopeOutput) > 0,
-                               isAlive: alive)
+    /// Immutable identity of a device, read once per AudioObjectID lifetime.
+    private func staticInfo(_ dev: AudioObjectID) -> StaticInfo? {
+        cacheLock.lock()
+        if let hit = staticByID[dev] { cacheLock.unlock(); return hit }
+        cacheLock.unlock()
+
+        guard let uid = Self.getString(dev, kAudioDevicePropertyDeviceUID) else { return nil }
+        let info = StaticInfo(uid: uid,
+                              name: Self.getString(dev, kAudioObjectPropertyName) ?? uid,
+                              transport: Self.getScalar(dev, Self.address(kAudioDevicePropertyTransportType),
+                                                        UInt32.self).map(Self.fourCC) ?? "?")
+        cacheLock.lock()
+        staticByID[dev] = info
+        idByUID[uid] = dev
+        cacheLock.unlock()
+        return info
+    }
+
+    /// O(1) after the sweep's enumeration; falls back to a rescan if the UID is
+    /// unknown (device appeared between events).
+    private func deviceID(forUID uid: String) -> AudioObjectID? {
+        cacheLock.lock()
+        let hit = idByUID[uid]
+        cacheLock.unlock()
+        if let hit { return hit }
+        _ = snapshotDevices()
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return idByUID[uid]
     }
 
     // MARK: - AudioSystem
 
     public func snapshotDevices() -> [AudioDeviceInfo] {
-        Self.allDeviceIDs().compactMap(Self.info(for:))
+        let ids = Self.allDeviceIDs()
+
+        // A changed ID set means IDs may have been recycled: drop identity caches.
+        cacheLock.lock()
+        let idsChanged = ids != knownDeviceIDs
+        if idsChanged {
+            knownDeviceIDs = ids
+            staticByID.removeAll()
+            idByUID.removeAll()
+        }
+        cacheLock.unlock()
+
+        return ids.compactMap { dev -> AudioDeviceInfo? in
+            guard let s = staticInfo(dev) else { return nil }
+            let alive = (Self.getScalar(dev, Self.address(kAudioDevicePropertyDeviceIsAlive), UInt32.self) ?? 1) != 0
+            return AudioDeviceInfo(uid: s.uid, name: s.name, transport: s.transport,
+                                   hasInput: Self.channelCount(dev, kAudioObjectPropertyScopeInput) > 0,
+                                   hasOutput: Self.channelCount(dev, kAudioObjectPropertyScopeOutput) > 0,
+                                   isAlive: alive)
+        }
     }
 
-    public func defaultInputUID() -> String? {
-        guard let dev = Self.getScalar(Self.systemObject,
-                                       Self.address(kAudioHardwarePropertyDefaultInputDevice),
-                                       AudioObjectID.self), dev != 0 else { return nil }
-        return Self.getString(dev, kAudioDevicePropertyDeviceUID)
+    private func defaultDeviceUID(_ sel: AudioObjectPropertySelector) -> String? {
+        guard let dev = Self.getScalar(Self.systemObject, Self.address(sel), AudioObjectID.self),
+              dev != 0 else { return nil }
+        return staticInfo(dev)?.uid
     }
 
-    public func defaultOutputUID() -> String? {
-        guard let dev = Self.getScalar(Self.systemObject,
-                                       Self.address(kAudioHardwarePropertyDefaultOutputDevice),
-                                       AudioObjectID.self), dev != 0 else { return nil }
-        return Self.getString(dev, kAudioDevicePropertyDeviceUID)
-    }
+    public func defaultInputUID() -> String? { defaultDeviceUID(kAudioHardwarePropertyDefaultInputDevice) }
+    public func defaultOutputUID() -> String? { defaultDeviceUID(kAudioHardwarePropertyDefaultOutputDevice) }
 
     public func setDefaultInput(uid: String) -> Bool {
-        guard let dev = Self.deviceID(forUID: uid) else { return false }
+        guard let dev = deviceID(forUID: uid) else { return false }
         var a = Self.address(kAudioHardwarePropertyDefaultInputDevice)
         var d = dev
         return AudioObjectSetPropertyData(Self.systemObject, &a, 0, nil,
@@ -201,19 +276,18 @@ public final class CoreAudioSystem: AudioSystem {
     }
 
     public func nominalRate(uid: String) -> Double? {
-        guard let dev = Self.deviceID(forUID: uid) else { return nil }
+        guard let dev = deviceID(forUID: uid) else { return nil }
         return Self.getScalar(dev, Self.address(kAudioDevicePropertyNominalSampleRate), Float64.self)
     }
 
     public func maxAvailableRate(uid: String) -> Double? {
-        guard let dev = Self.deviceID(forUID: uid) else { return nil }
-        let ranges = Self.getArray(dev, Self.address(kAudioDevicePropertyAvailableNominalSampleRates),
-                                   AudioValueRange.self)
-        return ranges.map(\.mMaximum).max()
+        guard let dev = deviceID(forUID: uid) else { return nil }
+        return Self.getArray(dev, Self.address(kAudioDevicePropertyAvailableNominalSampleRates),
+                             AudioValueRange.self).map(\.mMaximum).max()
     }
 
     public func setNominalRate(uid: String, rate: Double) -> Bool {
-        guard let dev = Self.deviceID(forUID: uid) else { return false }
+        guard let dev = deviceID(forUID: uid) else { return false }
         var a = Self.address(kAudioDevicePropertyNominalSampleRate)
         var r = Float64(rate)
         return AudioObjectSetPropertyData(dev, &a, 0, nil,
@@ -221,7 +295,7 @@ public final class CoreAudioSystem: AudioSystem {
     }
 
     public func isRunningSomewhere(uid: String) -> Bool {
-        guard let dev = Self.deviceID(forUID: uid) else { return false }
+        guard let dev = deviceID(forUID: uid) else { return false }
         return (Self.getScalar(dev, Self.address(kAudioDevicePropertyDeviceIsRunningSomewhere),
                                UInt32.self) ?? 0) != 0
     }

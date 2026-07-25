@@ -48,6 +48,54 @@ watch-list coverage.
   is oldest-launch-first with pid tiebreak, so simultaneous launches cannot
   both exit. Unit tests re-run: 23/23 pass.
 
+## Addendum 2 — CPU runaway in v1.0.0 (found and fixed)
+
+**Symptom:** BMR1 Guard sat at ~107 % CPU and dragged `coreaudiod` to ~52 %.
+Killing the app dropped `coreaudiod` to 0 %, proving the app was the driver.
+`sample` showed two threads pinned: one in
+`AudioObjectAdd/RemovePropertyListenerBlock` blocked on CoreAudio's global HAL
+mutex, one looping in `snapshotDevices()`.
+
+**Root cause (three compounding defects):**
+
+1. The property-listener callback tore down and re-installed *every* device
+   listener on *every* notification. Listener (de)registration takes a
+   process-wide HAL mutex, so this serialised against coreaudiod's own
+   notification delivery.
+2. Every notification queued a full state sweep with no coalescing, and each
+   sweep re-enumerated all audio devices 4+ times (`deviceID(forUID:)` did a
+   full enumeration per property read). Once sweeps were slower than events
+   arrived, the queue backed up permanently — congestion collapse.
+3. The watch-set comparison was order-sensitive, so CoreAudio's unstable
+   enumeration order caused spurious listener re-arms.
+
+Secondary defect: `stop()` used `queue.sync`, so quitting hung behind the
+backlog (the app could not be quit from the menu at all).
+
+**Fix:** listeners are re-armed only on structural events (device list changed
+/ coreaudiod restarted) or a genuine watch-set change; sweeps are coalesced to
+at most one per 150 ms with isolated events still running immediately; one
+device enumeration per sweep feeds a UID→ID map plus a cache of immutable
+identity properties (dropped whenever the device ID set changes, so recycled
+IDs can't alias); `status()` is served from a cached snapshot and never blocks
+the menu; `stop()` flips a lock-protected flag first so queued sweeps no-op;
+failing actions back off exponentially (capped at 30 s) instead of retrying
+flat-out.
+
+**Measured after the fix:**
+
+| Metric | Before | After |
+|---|---|---|
+| App CPU (idle) | ~107 % | 0.0 % (0.13 s CPU per ~50 s wall) |
+| coreaudiod CPU | ~52 % | 0.0 % |
+| Quit latency | hung indefinitely | 153 ms |
+| Takeover revert | 82 ms | 77 ms |
+| HFP→A2DP rate restore | ~150 ms | 221 ms |
+
+**Regression tests added** (suite now 28/28): notification-storm coalescing,
+no listener re-arm across steady-state sweeps, device-reorder does not re-arm,
+`stop()` is prompt and silences pending work, failing actions back off.
+
 ## SoundSource state
 
 SoundSource was quit for these tests and left quit, since running both

@@ -13,8 +13,17 @@ final class FakeAudioSystem: AudioSystem {
     private(set) var watched: [String] = []
     private(set) var setInputCalls: [String] = []
     private(set) var setRateCalls: [(String, Double)] = []
+    /// Proxy for "how much work did the engine do" — one per sweep.
+    private(set) var snapshotCount = 0
+    /// Counts only calls that actually change the watch set (i.e. listener re-arms).
+    private(set) var watchChangeCount = 0
 
-    func snapshotDevices() -> [AudioDeviceInfo] { devices }
+    private let lock = NSLock()
+
+    func snapshotDevices() -> [AudioDeviceInfo] {
+        lock.lock(); snapshotCount += 1; lock.unlock()
+        return devices
+    }
     func defaultInputUID() -> String? { defaultInput }
     func defaultOutputUID() -> String? { defaultOutput }
     func setDefaultInput(uid: String) -> Bool {
@@ -31,7 +40,14 @@ final class FakeAudioSystem: AudioSystem {
         return true
     }
     func isRunningSomewhere(uid: String) -> Bool { running.contains(uid) }
-    func watchDevices(uids: [String]) { watched = uids }
+    func watchDevices(uids: [String]) {
+        // Mirrors CoreAudioSystem: order-insensitive, no-op when unchanged.
+        let wanted = uids.sorted()
+        lock.lock(); defer { lock.unlock() }
+        guard watched != wanted else { return }
+        watched = wanted
+        watchChangeCount += 1
+    }
     func start() {}
     func stop() {}
 
@@ -67,7 +83,7 @@ final class GuardEngineTests: XCTestCase {
         audio.defaultOutput = bmr1Out.uid
         audio.rates[bmr1Out.uid] = 44100
         audio.maxRates[bmr1Out.uid] = 44100
-        engine = GuardEngine(audio: audio, store: store, sweepInterval: 3600)
+        engine = GuardEngine(audio: audio, store: store, sweepInterval: 3600, minSweepGap: 0.05)
         engine.start()
     }
 
@@ -76,10 +92,9 @@ final class GuardEngineTests: XCTestCase {
         super.tearDown()
     }
 
-    /// Run pending engine work by poking and syncing via status().
+    /// Deterministically run one sweep to completion (bypasses coalescing).
     private func settle() {
-        engine.poke()
-        _ = engine.status()
+        engine.sweepSynchronously()
     }
 
     func testTakeoverIsRevertedAndPersisted() {
@@ -162,6 +177,73 @@ final class GuardEngineTests: XCTestCase {
         XCTAssertTrue(audio.watched.contains(bmr1In.uid))
         XCTAssertTrue(audio.watched.contains(bmr1Out.uid))
         XCTAssertFalse(audio.watched.contains(builtinMic.uid))
+    }
+
+    // MARK: - CPU-runaway regressions (v1.0.0 shipped a 107%-CPU loop)
+
+    /// A storm of CoreAudio notifications must collapse into a handful of
+    /// sweeps, not one sweep per notification.
+    func testNotificationStormIsCoalesced() {
+        settle()
+        let before = audio.snapshotCount
+        for _ in 0..<200 { audio.fireChange() }
+        // Long enough for several coalescing windows (0.05s in this fixture).
+        Thread.sleep(forTimeInterval: 0.4)
+        let sweeps = audio.snapshotCount - before
+        XCTAssertLessThan(sweeps, 20, "200 events produced \(sweeps) sweeps — coalescing is broken")
+        XCTAssertGreaterThan(sweeps, 0, "events must still produce at least one sweep")
+    }
+
+    /// Steady-state sweeps must not churn the device-listener set: re-arming
+    /// listeners takes a process-wide HAL mutex and was the CPU hog.
+    func testRepeatedSweepsDoNotRearmListeners() {
+        settle()
+        let after1 = audio.watchChangeCount
+        for _ in 0..<50 { settle() }
+        XCTAssertEqual(audio.watchChangeCount, after1, "watch set must be stable across sweeps")
+    }
+
+    /// Watch-set comparison must be order-insensitive — CoreAudio does not
+    /// guarantee a stable device enumeration order.
+    func testDeviceReorderDoesNotRearmListeners() {
+        settle()
+        let baseline = audio.watchChangeCount
+        audio.devices = [bmr1Out, bmr1In, builtinMic]   // same set, different order
+        settle()
+        audio.devices = [builtinMic, bmr1In, bmr1Out]
+        settle()
+        XCTAssertEqual(audio.watchChangeCount, baseline, "reordering must not re-arm listeners")
+    }
+
+    /// stop() must not block behind queued work, and must silence further work.
+    func testStopIsPromptAndSilencesPendingWork() {
+        settle()
+        for _ in 0..<100 { audio.fireChange() }
+        let t0 = Date()
+        engine.stop()
+        XCTAssertLessThan(Date().timeIntervalSince(t0), 1.0, "stop() must not hang behind a backlog")
+
+        let after = audio.snapshotCount
+        for _ in 0..<50 { audio.fireChange() }
+        engine.poke()
+        Thread.sleep(forTimeInterval: 0.25)
+        XCTAssertEqual(audio.snapshotCount, after, "no sweeps may run after stop()")
+        engine.start()   // tearDown expects a live engine
+    }
+
+    /// A permanently failing action must back off, not spin.
+    func testFailingActionBacksOffInsteadOfSpinning() {
+        settle()
+        // Tracked device vanishes from the fake's world so setDefaultInput fails,
+        // while the policy keeps asking for it.
+        audio.defaultInput = bmr1In.uid
+        audio.devices = [bmr1In, bmr1Out]
+        settle()
+        let attempts1 = audio.setInputCalls.count
+        Thread.sleep(forTimeInterval: 0.3)
+        let attempts2 = audio.setInputCalls.count
+        XCTAssertLessThan(attempts2 - attempts1, 5,
+                          "failed action retried \(attempts2 - attempts1)× in 0.3 s — backoff is broken")
     }
 
     func testPersistedLastGoodAdoptedOnStart() {

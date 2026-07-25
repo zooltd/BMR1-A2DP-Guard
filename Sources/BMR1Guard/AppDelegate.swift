@@ -82,8 +82,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.appearsDisabled = !s.enabled
     }
 
-    // Rebuild the menu each time it opens so it always shows live state.
+    // Rebuild the menu each time it opens. `status()` is a cached snapshot
+    // (never blocks on audio work); the poke refreshes it for the next open.
     func menuNeedsUpdate(_ menu: NSMenu) {
+        engine.poke()
         menu.removeAllItems()
         let s = engine.status()
         let blocked = UserDefaults.standard.string(forKey: "BlockedDeviceName") ?? "Drop-BMR1"
@@ -141,7 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func togglePause() {
-        engine.setEnabled(!engine.status().enabled)
+        engine.setEnabled(!engine.enabled)
         refreshTitle()
     }
 

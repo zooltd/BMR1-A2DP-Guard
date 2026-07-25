@@ -18,6 +18,8 @@ speaker in output-only/A2DP mode — a replacement for SoundSource's per-device
   ever drops to the 16 kHz HFP path, the guard restores 44.1 kHz (measured:
   <150 ms) — deferring politely while something is actively recording from the
   BMR1 input so it never fights a live SCO link.
+- **Costs nothing to run.** Idle CPU is 0.0 % (≈0.13 s of CPU per minute of
+  wall time); it reacts to CoreAudio notifications rather than polling.
 - **Leaves everything else alone.** Drop-BMR1 stays available (and default, if
   you chose it) as an *output*. Quitting the app restores stock macOS behavior
   instantly — no drivers, no daemons, no system modifications.
