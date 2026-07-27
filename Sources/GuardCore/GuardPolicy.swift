@@ -31,10 +31,26 @@ public struct GuardConfig: Equatable, Sendable {
     /// survives the device being renamed).
     public var blockedInputUIDs: [String]
 
+    /// Force the guarded output's nominal sample rate back to its A2DP maximum
+    /// when it drops to the HFP rate.
+    ///
+    /// **Off by default, deliberately.** Writing a nominal sample rate to a
+    /// Bluetooth device forces the stack to renegotiate the audio link; doing
+    /// that while the link is already mid-negotiation is a plausible way to
+    /// wedge speaker firmware (the exact symptom this app exists to avoid).
+    /// The observation study also found that SoundSource — which solves the
+    /// problem completely on this hardware — changes *no* public CoreAudio
+    /// property and only enforces the default input. Blocking the default
+    /// input is what prevents HFP; forcing rates is only recovery, and it is
+    /// the risky half. Enable it if you specifically want that recovery.
+    public var restoreA2DPRate: Bool
+
     public init(blockedBluetoothNames: [String] = ["Drop-BMR1"],
-                blockedInputUIDs: [String] = []) {
+                blockedInputUIDs: [String] = [],
+                restoreA2DPRate: Bool = false) {
         self.blockedBluetoothNames = blockedBluetoothNames
         self.blockedInputUIDs = blockedInputUIDs
+        self.restoreA2DPRate = restoreA2DPRate
     }
 }
 
@@ -123,6 +139,7 @@ public struct GuardPolicy: Sendable {
                                     maxAvailableRate: Double,
                                     outputUID: String,
                                     blockedInputBusy: Bool) -> [PolicyAction] {
+        guard config.restoreA2DPRate else { return [] }
         guard maxAvailableRate > 0, currentRate < maxAvailableRate else { return [] }
         guard !blockedInputBusy else { return [] }
         return [.setNominalRate(uid: outputUID, rate: maxAvailableRate,

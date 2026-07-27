@@ -96,6 +96,52 @@ flat-out.
 no listener re-arm across steady-state sweeps, device-reorder does not re-arm,
 `stop()` is prompt and silences pending work, failing actions back off.
 
+## Addendum 3 — speaker went silent while all guarded metrics were green
+
+Reported: speaker produced no audio while the app was running normally.
+State captured at the time of the failure:
+
+| Property | Value |
+|---|---|
+| Default input | `BuiltInMicrophoneDevice` (guard working — BMR1 not default) |
+| Default output | `42-DA-EC-84-61-F5:output` |
+| Output nominal rate | 44 100 Hz (A2DP), stream `isActive=1` |
+| Output `isAlive` / `hogPID` | 1 / none |
+| Output `isRunningSomewhere` during a test sound | 1 |
+| BMR1 input `isRunningSomewhere` | 0 (nothing recording) |
+| Bluetooth services | `HFP AVRCP A2DP ACL`, connected |
+
+A test sound was played: macOS reported it streaming at 44.1 kHz; the user
+confirmed **nothing was audible**. Every property the app can observe was
+healthy, so the failure is in the Bluetooth link / speaker firmware, *below*
+CoreAudio. Only a speaker power-cycle (or BT reconnect) recovers it. This
+matches the pre-existing symptom described in the original brief.
+
+**Self-suspicion (acted on):** forcing the output's nominal sample rate back to
+44.1 kHz — which this app did automatically until now — makes the Bluetooth
+stack renegotiate the audio link. Doing that during a reconnect, or repeatedly
+(as could happen during the v1.0.0 CPU runaway), is a plausible way to wedge
+the firmware. Rate forcing is therefore **off by default** from v1.0.2, opt-in
+via the menu, and throttled to one write per 30 s when enabled. Input blocking
+— the mechanism that actually prevents HFP, and the only thing SoundSource was
+observed to do — is unchanged and always on.
+
+**Diagnostic gap closed:** `log show` returns zero rows for any predicate in a
+non-interactive shell on this machine (TCC), so os_log was useless for
+post-mortems — an earlier inference of mine that "no log events" meant "no
+enforcement activity" was unfounded for that reason. The app now writes
+`~/Library/Logs/BMR1Guard.log`. Within seconds of the first run it captured a
+genuine event, confirming both the log and the guard:
+
+```
+01:38:06  state: in=42-DA-EC-84-61-F5:input out=42-DA-EC-84-61-F5:output rate=44100 …
+01:38:06  Drop-BMR1 took default input; restoring last good input → set default input OK
+01:38:07  state: in=BuiltInMicrophoneDevice out=42-DA-EC-84-61-F5:output rate=44100 …
+```
+
+Suite now 31/31 (adds: rate forcing off by default, input blocking works with
+it off, rate-write cooldown throttling).
+
 ## SoundSource state
 
 SoundSource was quit for these tests and left quit, since running both

@@ -83,7 +83,10 @@ final class GuardEngineTests: XCTestCase {
         audio.defaultOutput = bmr1Out.uid
         audio.rates[bmr1Out.uid] = 44100
         audio.maxRates[bmr1Out.uid] = 44100
-        engine = GuardEngine(audio: audio, store: store, sweepInterval: 3600, minSweepGap: 0.05)
+        engine = GuardEngine(audio: audio, store: store,
+                             config: GuardConfig(blockedBluetoothNames: ["Drop-BMR1"],
+                                                 restoreA2DPRate: true),
+                             sweepInterval: 3600, minSweepGap: 0.05, rateWriteCooldown: 0)
         engine.start()
     }
 
@@ -244,6 +247,30 @@ final class GuardEngineTests: XCTestCase {
         let attempts2 = audio.setInputCalls.count
         XCTAssertLessThan(attempts2 - attempts1, 5,
                           "failed action retried \(attempts2 - attempts1)× in 0.3 s — backoff is broken")
+    }
+
+    /// Even with rate forcing enabled, writes must be throttled: repeatedly
+    /// renegotiating a Bluetooth audio link is what wedges speaker firmware.
+    func testRateWritesAreThrottledByCooldown() {
+        let a = FakeAudioSystem()
+        a.devices = [builtinMic, bmr1In, bmr1Out]
+        a.defaultInput = builtinMic.uid
+        a.defaultOutput = bmr1Out.uid
+        a.rates[bmr1Out.uid] = 44100
+        a.maxRates[bmr1Out.uid] = 44100
+        let e = GuardEngine(audio: a, store: MemoryStore(),
+                            config: GuardConfig(blockedBluetoothNames: ["Drop-BMR1"],
+                                                restoreA2DPRate: true),
+                            sweepInterval: 3600, minSweepGap: 0.01, rateWriteCooldown: 60)
+        e.start()
+        defer { e.stop() }
+
+        for _ in 0..<10 {
+            a.rates[bmr1Out.uid] = 16000     // device keeps flipping back to HFP
+            e.sweepSynchronously()
+        }
+        XCTAssertEqual(a.setRateCalls.count, 1,
+                       "cooldown must permit one rate write, got \(a.setRateCalls.count)")
     }
 
     func testPersistedLastGoodAdoptedOnStart() {

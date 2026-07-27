@@ -46,6 +46,8 @@ public final class GuardEngine: @unchecked Sendable {
     private var sweepScheduled = false
     private var lastSweepFinished = Date.distantPast
     private var consecutiveFailures = 0
+    private var lastRateWrite = Date.distantPast
+    private var lastObserved = ""
 
     // Lock-protected state (read from the UI thread).
     private let stateLock = NSLock()
@@ -62,16 +64,25 @@ public final class GuardEngine: @unchecked Sendable {
     /// Minimum spacing between sweeps; bursts collapse into one.
     private let minSweepGap: TimeInterval
     private static let maxRetryDelay: TimeInterval = 30
+    /// Hard floor between two sample-rate writes to the same Bluetooth device.
+    /// Renegotiating a BT audio link repeatedly is what wedges speaker firmware,
+    /// so even a misbehaving policy cannot machine-gun the stack.
+    private let rateWriteCooldown: TimeInterval
+    private let sink: EventSink?
 
     public init(audio: AudioSystem, store: GuardStateStore,
                 config: GuardConfig = GuardConfig(),
                 sweepInterval: TimeInterval = 5.0,
-                minSweepGap: TimeInterval = 0.15) {
+                minSweepGap: TimeInterval = 0.15,
+                rateWriteCooldown: TimeInterval = 30.0,
+                sink: EventSink? = nil) {
         self.audio = audio
         self.store = store
         self.policy = GuardPolicy(config: config)
         self.sweepInterval = sweepInterval
         self.minSweepGap = minSweepGap
+        self.rateWriteCooldown = rateWriteCooldown
+        self.sink = sink
     }
 
     public var enabled: Bool {
@@ -142,6 +153,16 @@ public final class GuardEngine: @unchecked Sendable {
     /// Request a sweep soon (coalescing). Safe to call from any thread, at any rate.
     public func poke() { requestSweep() }
 
+    /// Toggle the (off-by-default, risky) A2DP sample-rate recovery at runtime.
+    public func setRestoreA2DPRate(_ on: Bool) {
+        queue.async {
+            self.policy.config.restoreA2DPRate = on
+            self.appendEvent(on ? "A2DP rate forcing ENABLED (may renegotiate the BT link)"
+                                : "A2DP rate forcing disabled")
+            self.sweepLocked()
+        }
+    }
+
     /// Run one sweep synchronously — for tests and diagnostics only.
     public func sweepSynchronously() {
         queue.sync {
@@ -206,6 +227,17 @@ public final class GuardEngine: @unchecked Sendable {
             }
         }
 
+        // Forensics: record observed state transitions even when we take no
+        // action, so a later speaker failure can be correlated with what the
+        // system actually did. Silent while nothing changes.
+        let observed = "in=\(defaultIn ?? "—") out=\(defaultOut ?? "—") "
+            + "rate=\(outputRate.map { String(Int($0)) } ?? "—") "
+            + "devices=\(devices.count) guarded=\(guardedOutput != nil ? "present" : "absent")"
+        if observed != lastObserved {
+            lastObserved = observed
+            sink?.write("state: \(observed)")
+        }
+
         if previousLastGood != policy.lastGoodInputUID {
             store.saveLastGoodInputUID(policy.lastGoodInputUID)
             let name = devices.first(where: { $0.uid == policy.lastGoodInputUID })?.name
@@ -222,6 +254,12 @@ public final class GuardEngine: @unchecked Sendable {
                     appendEvent("\(reason) → set default input \(ok ? "OK" : "FAILED")")
                     failed = failed || !ok
                 case let .setNominalRate(uid, rate, reason):
+                    let sinceLast = Date().timeIntervalSince(lastRateWrite)
+                    guard sinceLast >= rateWriteCooldown else {
+                        appendEvent("\(reason) → deferred (rate write cooldown, \(Int(rateWriteCooldown - sinceLast))s left)")
+                        break
+                    }
+                    lastRateWrite = Date()
                     let ok = audio.setNominalRate(uid: uid, rate: rate)
                     appendEvent("\(reason) → set rate \(ok ? "OK" : "FAILED")")
                     failed = failed || !ok
@@ -276,6 +314,7 @@ public final class GuardEngine: @unchecked Sendable {
         events.append(GuardEvent(date: now, message: message))
         if events.count > 50 { events.removeFirst(events.count - 50) }
         log.info("\(message, privacy: .public)")
+        sink?.write(message)
         stateLock.lock(); _cachedStatus.events = events; stateLock.unlock()
         onStatusChanged?()
     }

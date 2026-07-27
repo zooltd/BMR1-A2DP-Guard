@@ -19,8 +19,10 @@ final class GuardPolicyTests: XCTestCase {
     let teamsVirt = AudioDeviceInfo(uid: "MSLoopbackDriverDevice_UID", name: "Microsoft Teams Audio",
                                     transport: "virt", hasInput: true, hasOutput: true)
 
-    func makePolicy(lastGood: String? = nil) -> GuardPolicy {
-        GuardPolicy(config: GuardConfig(blockedBluetoothNames: ["Drop-BMR1"]), lastGoodInputUID: lastGood)
+    func makePolicy(lastGood: String? = nil, restoreRate: Bool = true) -> GuardPolicy {
+        GuardPolicy(config: GuardConfig(blockedBluetoothNames: ["Drop-BMR1"],
+                                        restoreA2DPRate: restoreRate),
+                    lastGoodInputUID: lastGood)
     }
 
     // MARK: Classification
@@ -171,6 +173,28 @@ final class GuardPolicyTests: XCTestCase {
         // do not fight the SCO link; recover after it stops.
         XCTAssertEqual(p.onGuardedOutputRate(currentRate: 16000, maxAvailableRate: 44100,
                                              outputUID: bmr1Out.uid, blockedInputBusy: true), [])
+    }
+
+    /// Rate forcing renegotiates the Bluetooth link and can wedge speaker
+    /// firmware, so it must be opt-in — the default build must never write a
+    /// sample rate.
+    func testRateForcingIsOffByDefault() {
+        let p = GuardPolicy(config: GuardConfig(blockedBluetoothNames: ["Drop-BMR1"]))
+        XCTAssertFalse(p.config.restoreA2DPRate)
+        XCTAssertEqual(p.onGuardedOutputRate(currentRate: 16000, maxAvailableRate: 44100,
+                                             outputUID: bmr1Out.uid, blockedInputBusy: false), [],
+                       "default configuration must not touch the sample rate")
+    }
+
+    /// Blocking the default input must keep working with rate forcing off —
+    /// that is the mechanism that actually prevents HFP.
+    func testInputBlockingStillWorksWithRateForcingOff() {
+        var p = makePolicy(restoreRate: false)
+        let devices = [builtinMic, bmr1In, bmr1Out]
+        _ = p.onDefaultInput(uid: builtinMic.uid, devices: devices)
+        let actions = p.onDefaultInput(uid: bmr1In.uid, devices: devices)
+        XCTAssertEqual(actions.count, 1)
+        if case let .setDefaultInput(uid, _) = actions[0] { XCTAssertEqual(uid, builtinMic.uid) }
     }
 
     func testOutputRateNoActionAtA2DP() {

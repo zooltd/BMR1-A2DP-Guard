@@ -3,8 +3,10 @@ import GuardCore
 import ServiceManagement
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    static let restoreRateKey = "RestoreA2DPRate"
     private var statusItem: NSStatusItem!
     private var engine: GuardEngine!
+    private var fileLog: FileEventLog!
     private let dateFmt: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
@@ -17,10 +19,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defaults.register(defaults: ["BlockedDeviceName": "Drop-BMR1"])
         let blockedName = defaults.string(forKey: "BlockedDeviceName") ?? "Drop-BMR1"
 
-        let config = GuardConfig(blockedBluetoothNames: [blockedName])
+        let config = GuardConfig(blockedBluetoothNames: [blockedName],
+                                 restoreA2DPRate: defaults.bool(forKey: Self.restoreRateKey))
+        fileLog = FileEventLog()
         engine = GuardEngine(audio: CoreAudioSystem(),
                              store: UserDefaultsStateStore(),
-                             config: config)
+                             config: config,
+                             sink: fileLog)
         engine.onStatusChanged = { [weak self] in
             DispatchQueue.main.async { self?.refreshTitle() }
         }
@@ -130,6 +135,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(enforce)
         menu.addItem(.separator())
 
+        let rateItem = NSMenuItem(title: "Force A2DP Sample Rate (risky)",
+                                  action: #selector(toggleRateRestore), keyEquivalent: "")
+        rateItem.target = self
+        rateItem.state = UserDefaults.standard.bool(forKey: Self.restoreRateKey) ? .on : .off
+        rateItem.toolTip = "Writes the speaker's sample rate back to 44.1 kHz when it drops to the 16 kHz HFP rate. "
+            + "This forces the Bluetooth stack to renegotiate the link and can wedge speaker firmware. "
+            + "Blocking the default input (always on) is what actually prevents HFP."
+        menu.addItem(rateItem)
+
+        let revealLog = NSMenuItem(title: "Show Log in Finder", action: #selector(showLog), keyEquivalent: "")
+        revealLog.target = self
+        menu.addItem(revealLog)
+        menu.addItem(.separator())
+
         let login = NSMenuItem(title: "Launch at Login",
                                action: #selector(toggleLoginItem), keyEquivalent: "")
         login.target = self
@@ -149,6 +168,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func enforceNow() {
         engine.poke()
+    }
+
+    @objc private func toggleRateRestore() {
+        let defaults = UserDefaults.standard
+        let newValue = !defaults.bool(forKey: Self.restoreRateKey)
+        defaults.set(newValue, forKey: Self.restoreRateKey)
+        engine.setRestoreA2DPRate(newValue)
+    }
+
+    @objc private func showLog() {
+        NSWorkspace.shared.selectFile(fileLog.path, inFileViewerRootedAtPath: "")
     }
 
     @objc private func toggleLoginItem() {

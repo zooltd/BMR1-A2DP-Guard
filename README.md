@@ -14,10 +14,18 @@ speaker in output-only/A2DP mode — a replacement for SoundSource's per-device
   display, virtual, Continuity, or *other Bluetooth* microphones — every switch
   to a non-BMR1 device is accepted and remembered (persisted across restarts).
   There is no fixed priority list and no permanent lock on the MacBook mic.
-- **Keeps the speaker on A2DP.** If the Drop-BMR1 output's nominal sample rate
-  ever drops to the 16 kHz HFP path, the guard restores 44.1 kHz (measured:
-  <150 ms) — deferring politely while something is actively recording from the
-  BMR1 input so it never fights a live SCO link.
+- **Keeps the speaker on A2DP** — by preventing the HFP switch in the first
+  place. Blocking the default input is the mechanism that does this.
+- **Sample-rate forcing is opt-in and off by default** (menu → *Force A2DP
+  Sample Rate (risky)*). Writing a nominal sample rate to a Bluetooth device
+  makes the stack renegotiate the audio link, which can wedge speaker firmware
+  — the very symptom this app exists to avoid. The observation study found
+  SoundSource changes no CoreAudio property at all, so rate forcing is beyond
+  the known-good behaviour. When enabled, writes are throttled to one per 30 s.
+- **Writes a log you can actually read** at `~/Library/Logs/BMR1Guard.log`
+  (menu → *Show Log in Finder*), recording every state transition and action.
+  `log show` is TCC-restricted for non-interactive shells, so os_log alone
+  makes post-mortems impossible.
 - **Costs nothing to run.** Idle CPU is 0.0 % (≈0.13 s of CPU per minute of
   wall time); it reacts to CoreAudio notifications rather than polling.
 - **Leaves everything else alone.** Drop-BMR1 stays available (and default, if
