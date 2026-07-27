@@ -8,5 +8,6 @@ tools/audioprobe
 tools/audioctl
 # generated from makeicon.swift (AppIcon.icns is committed)
 Support/AppIcon.iconset/
-# raw CoreAudio captures: contain identifiers of every local audio device
+# raw captures: contain identifiers of every local audio/Bluetooth device
 captures/*.json
+captures/*/

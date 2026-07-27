@@ -43,6 +43,16 @@ that with CoreAudio property listeners + instant restore.
 
 **Honest limitations:**
 
+- **The speaker can go silent in a way macOS cannot see, and this app cannot
+  fix it.** A controlled A/B capture (silent state vs. working state after a
+  power-cycle, same script minutes apart) found *every* CoreAudio property
+  byte-identical: same active 44.1 kHz A2DP stream, same alive flag, IO
+  actually running during playback in both. Volume was the only difference and
+  it was inverted — the silent state was louder. That is a speaker firmware
+  fault with no observable signature, so no app in this class can detect it,
+  and only power-cycling the speaker clears it. See TEST-RESULTS.md
+  "Addendum 4". Do not expect this tool — or any tool — to prevent that.
+
 - The Drop-BMR1 microphone **still appears** in System Settings → Sound →
   Input. Neither this app nor (observably) SoundSource removes it. It just can
   never *stay* selected as default. (An app that explicitly opens the BMR1

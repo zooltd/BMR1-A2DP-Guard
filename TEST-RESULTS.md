@@ -142,6 +142,52 @@ genuine event, confirming both the log and the guard:
 Suite now 31/31 (adds: rate forcing off by default, input blocking works with
 it off, rate-write cooldown throttling).
 
+## Addendum 4 — the silence is invisible to macOS (controlled A/B capture)
+
+The decisive experiment. `tools/capture-state.sh` dumped every observable
+audio/Bluetooth fact twice: once while the speaker was **silent**, then again
+after a power-cycle restored sound. Same script, same scope, ~2 minutes apart.
+
+**Result: every CoreAudio property is byte-identical between the broken and
+working states.**
+
+| Compared | Silent vs working |
+|---|---|
+| Full CoreAudio dump (devices, streams, physical/virtual formats, available rates, alive, running, hog, data sources) | **identical** — zero differences after normalising object IDs, which are reassigned on every reconnect |
+| Device-list membership | identical |
+| Default input / output / system output | identical |
+| `isRunningSomewhere` during playback | 0 → 1 in **both** states |
+| Output stream physical format | 44 100 Hz in both |
+| Bluetooth (`system_profiler`): address, services, firmware, product/vendor ID, connection state | identical (`HFP AVRCP A2DP ACL`, connected) |
+| Volume / mute | the only difference — and **inverted**: silent at 0.55, working at 0.21 |
+
+The volume comparison rules volume out conclusively: the state that produced
+no sound was more than twice as loud as the state that works.
+
+### What this proves
+
+The failure mode is **entirely invisible to public macOS APIs**. macOS reports
+a live A2DP endpoint, an active 44.1 kHz stream, and IO actually running, while
+the speaker renders nothing. Consequences, stated plainly:
+
+1. **No app of this class can detect this state** — not BMR1 Guard, and not
+   SoundSource. There is no property to poll, no notification to observe, and
+   no way to distinguish "playing" from "playing into a void".
+2. **Therefore it cannot be auto-recovered**, because there is no trigger to
+   act on. Only a power-cycle of the speaker is known to clear it.
+3. It is a **speaker firmware fault**, not a macOS routing fault. The guard's
+   job — stopping macOS from routing recording to the speaker, which is what
+   drives it into HFP — is a different problem, and the log shows it working
+   (reconnect at 01:39:24 → takeover → reverted in 4 ms).
+4. Whether an HFP episode *causes* the wedge is **unproven and unprovable from
+   the Mac**: since the profile in use is not exposed, the correlation cannot
+   be observed even in principle.
+
+Untested idea for future work: a menu action that drops and re-establishes the
+Bluetooth link from the Mac side, as a one-click alternative to walking over to
+the speaker. It is unknown whether a Mac-side reconnect clears the wedge — only
+a speaker power-cycle is confirmed to work.
+
 ## SoundSource state
 
 SoundSource was quit for these tests and left quit, since running both
