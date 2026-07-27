@@ -159,10 +159,13 @@ working states.**
 | `isRunningSomewhere` during playback | 0 → 1 in **both** states |
 | Output stream physical format | 44 100 Hz in both |
 | Bluetooth (`system_profiler`): address, services, firmware, product/vendor ID, connection state | identical (`HFP AVRCP A2DP ACL`, connected) |
-| Volume / mute | the only difference — and **inverted**: silent at 0.55, working at 0.21 |
+| Volume / mute | the only difference — **human-caused, not system-caused** (0.55 while silent, 0.21 while working) |
 
-The volume comparison rules volume out conclusively: the state that produced
-no sound was more than twice as loud as the state that works.
+The volume delta carries no signal: 0.55 was set during diagnosis to rule out a
+quiet-speaker explanation, and the owner adjusted volume again after the
+reconnect. It is also inverted — the state that produced *no* sound was more
+than twice as loud as the state that works. Discounting it, **no
+machine-controlled property differed at all**.
 
 ### What this proves
 
